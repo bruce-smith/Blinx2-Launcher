@@ -108,7 +108,7 @@ public sealed class MainForm : Form
                    "installs the tools the build needs (it asks first), downloads the project's source code and " +
                    "compiles it on your PC. Nothing of the game is downloaded: you need your own copy of the " +
                    "North American (NTSC-U) Blinx 2 disc as an .iso or .xiso image.\r\n\r\n" +
-                   "It takes 45-60 minutes on a recent PC (longer on older ones) and needs an internet connection. " +
+                   "It takes about 30 minutes on a recent PC (longer on older ones, plus 15-30 minutes if Visual Studio has to be installed) and needs an internet connection. " +
                    "You can leave it alone while it works; if it is interrupted, run it again and it continues.",
         });
 
@@ -195,9 +195,8 @@ public sealed class MainForm : Form
             else if (state.Done.Count > 0) sb.AppendLine($"A setup in this folder stopped part-way ({state.Done.Count} steps done); Next continues it.");
             if (extracted) sb.AppendLine("The game files are already extracted here; the disc image is not needed again.");
             long free = Cli.FreeSpace(dir);
-            long isoSize = File.Exists(_iso.Text) ? new FileInfo(_iso.Text).Length : 3_400_000_000;
-            long need = (extracted ? 0 : isoSize) + 6L * 1024 * 1024 * 1024;
-            if (installed) need = 0;
+            var iso = Setup.ResolveIso(_iso.Text.Trim().Trim('"'), out _) ?? "";
+            long need = installed ? 0 : new Setup(dir, iso, _log, _runner, _tc ?? new Toolchain()).SpaceNeeded(null);
             sb.AppendLine($"Free space on {Path.GetPathRoot(dir)}: {Util.FormatSize(free)}" +
                           (need > 0 ? $" (a full setup needs about {Util.FormatSize(need)})" : ""));
             if (need > free) sb.AppendLine("Not enough free space: choose another drive or free some space.");
@@ -241,8 +240,8 @@ public sealed class MainForm : Form
     private void BuildDepsPage()
     {
         _depList.Columns.Add("", 70);
-        _depList.Columns.Add("Needed", 300);
-        _depList.Columns.Add("Found", 420);
+        _depList.Columns.Add("Needed", 380);
+        _depList.Columns.Add("Found", 520);
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 0) };
         buttons.Controls.Add(_depsNext);
         buttons.Controls.Add(_installDeps);

@@ -84,8 +84,8 @@ public sealed class ProcRunner
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         try { proc.Start(); }
         catch (Win32Exception e) { throw new SetupException($"Could not start {exe}: {e.Message}"); }
-        if (!o.Detached && _job != IntPtr.Zero)
-            Native.AssignProcessToJobObject(_job, proc.Handle);
+        if (!o.Detached && _job != IntPtr.Zero && !Native.AssignProcessToJobObject(_job, proc.Handle))
+            _log.Info($"  (could not add the process to the setup's job: error {Marshal.GetLastWin32Error()})");
         proc.StandardInput.Close();
 
         void Pump(StreamReader r)

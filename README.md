@@ -43,13 +43,13 @@ your PC.
 
 Double-click `Blinx2Setup.exe`. It needs no .NET installation.
 
-- **Time:** about 45-60 minutes on a recent PC: about 20 minutes for the
-  recompiler and 15-20 for the compile. Add 15-30 minutes if Visual Studio
-  has to be installed first. Each step shows its progress and an estimate of
+- **Time:** about 30 minutes on a recent PC (measured on a 32-thread PC:
+  25 minutes; about 7 for the recompiler, 17 for the compile). Slower PCs
+  take longer. Add 15-30 minutes if Visual Studio has to be installed first. Each step shows its progress and an estimate of
   the time left. You can leave the PC alone, and it will not go to sleep
   while the setup runs.
-- **Disk:** about 10 GB, plus about 6 GB if Visual Studio has to be
-  installed. The setup checks the free space first.
+- **Disk:** about 4.5 GB (measured: game files 3.2 GB, generated C and
+  build 0.9 GB), plus about 6 GB if Visual Studio has to be installed. The setup checks the free space first.
 - **Internet:** needed for the tools, the source, and the libraries the
   build downloads (Vulkan headers, glslang, volk, ImGui).
 - **Interrupted?** Run it again with the same folder and it continues at
@@ -93,6 +93,11 @@ Blinx2Setup.exe --cli --iso <file or folder> [--dir <install folder>]
 - `--dry-run` only reports what is installed, what it would install (the
   exact winget commands) and which steps would run.
 - `--update` pulls the newest project commits first.
+
+For testing the install path on a PC that already has everything:
+`BLINX2SETUP_PRETEND_MISSING=git,vs,cmake,python,vcredist` reports those as
+missing, `BLINX2SETUP_DRY_INSTALL=1` logs the winget commands instead of
+running them, and `BLINX2SETUP_SHORTCUT_DIR=<dir>` puts the shortcuts there.
 
 Exit codes: 0 done, 1 a step failed, 2 bad arguments, 3 tools missing,
 4 not enough disk space, 5 cancelled.

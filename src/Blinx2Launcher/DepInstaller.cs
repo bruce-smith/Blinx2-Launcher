@@ -16,7 +16,8 @@ public static class DepInstaller
             if (d.WingetId == null)
                 throw new SetupException($"{d.Name} cannot be installed automatically. Download it from {d.ManualUrl}.");
             log.Info($"Installing {d.Name} ({d.InstallTime})");
-            if (dryRun)
+            // BLINX2SETUP_DRY_INSTALL=1: log the winget command instead (tests).
+            if (dryRun || Environment.GetEnvironmentVariable("BLINX2SETUP_DRY_INSTALL") == "1")
             {
                 log.Info("  dry run, would run: " + Describe(d));
                 continue;

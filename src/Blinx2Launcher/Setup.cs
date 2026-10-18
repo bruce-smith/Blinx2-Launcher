@@ -101,7 +101,7 @@ public sealed class Setup
 
         Steps = new List<Step>
         {
-            new() { Id = "xdvdfs", Title = "Download the disc extractor (xdvdfs)", Typical = TimeSpan.FromSeconds(20),
+            new() { Id = "xdvdfs", Title = "Download the disc extractor (xdvdfs)", Typical = TimeSpan.FromSeconds(10),
                     Key = () => XdvdfsVersion, Run = GetXdvdfs },
             new() { Id = "extract", Title = "Extract the game files from your disc image", Typical = TimeSpan.FromMinutes(2),
                     Key = () => "1", Run = Extract },
@@ -111,19 +111,19 @@ public sealed class Setup
                     Key = () => CapstoneSpec + "|" + _tc.Python, Run = PythonEnv },
             new() { Id = "xbe_parser", Title = "Recompiler 1/5: read the game's executable", Typical = TimeSpan.FromSeconds(15),
                     Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.xbe_parser", Xbe, "--json", Path.Combine(GameDir, "mygame_analysis.json")) },
-            new() { Id = "disasm", Title = "Recompiler 2/5: disassemble", Typical = TimeSpan.FromMinutes(1),
+            new() { Id = "disasm", Title = "Recompiler 2/5: disassemble", Typical = TimeSpan.FromMinutes(1.5),
                     Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.disasm", Xbe, "--text-only",
                         "--extra-sections", ExtraSections,
                         "--seed-functions", Path.Combine(GameProject, "seeds", "seed_functions.json")) },
             new() { Id = "func_id", Title = "Recompiler 3/5: identify library functions", Typical = TimeSpan.FromSeconds(40),
                     Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.func_id", Xbe, "-v") },
-            new() { Id = "abi_analysis", Title = "Recompiler 4/5: analyse calling conventions", Typical = TimeSpan.FromMinutes(1.5),
+            new() { Id = "abi_analysis", Title = "Recompiler 4/5: analyse calling conventions", Typical = TimeSpan.FromSeconds(30),
                     Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.abi_analysis", Xbe, "-v") },
-            new() { Id = "recomp", Title = "Recompiler 5/5: translate the game to C", Typical = TimeSpan.FromMinutes(16),
+            new() { Id = "recomp", Title = "Recompiler 5/5: translate the game to C", Typical = TimeSpan.FromMinutes(6),
                     Key = Revision, Cascade = true, Run = Recomp },
-            new() { Id = "configure", Title = "Configure the build (CMake)", Typical = TimeSpan.FromMinutes(3),
+            new() { Id = "configure", Title = "Configure the build (CMake)", Typical = TimeSpan.FromMinutes(1.5),
                     Key = () => Revision() + "|" + _tc.Generator + "|" + _tc.VsPath, Cascade = true, Run = Configure },
-            new() { Id = "build", Title = "Compile the game", Typical = TimeSpan.FromMinutes(18),
+            new() { Id = "build", Title = "Compile the game", Typical = TimeSpan.FromMinutes(17),
                     Key = Revision, Cascade = true, Run = Build },
             new() { Id = "finish", Title = "Point the game at its files, create shortcuts", Typical = TimeSpan.FromSeconds(5),
                     Key = Revision, Cascade = true, Run = Finish },
@@ -170,10 +170,13 @@ public sealed class Setup
     public TimeSpan Estimate(IEnumerable<Step> steps) =>
         TimeSpan.FromTicks(steps.Sum(s => s.Typical.Ticks));
 
-    /// <summary>Disk space the pending steps need (measured on a full run,
-    /// with a margin).</summary>
-    public long SpaceNeeded(List<Step> pending)
+    /// <summary>Disk space the pending steps need. Measured on a full run
+    /// (2026-10-18): game files 3.2 GB (the ISO's size), clone ~0.2 GB,
+    /// pipeline output 0.13 GB, generated C 0.13 GB, build 0.6 GB; 4.1 GB in
+    /// all. With a margin for the compiler's temporary files.</summary>
+    public long SpaceNeeded(List<Step>? pending = null)
     {
+        pending ??= Pending();
         const long GB = 1L << 30, MB = 1L << 20;
         long need = 0;
         foreach (var s in pending)
@@ -181,12 +184,12 @@ public sealed class Setup
             {
                 "xdvdfs" => 10 * MB,
                 "extract" => File.Exists(IsoPath) ? new FileInfo(IsoPath).Length : 3 * GB,
-                "clone" => 200 * MB,
-                "python" => 100 * MB,
-                "disasm" or "func_id" or "abi_analysis" => 300 * MB,
-                "recomp" => 500 * MB,
-                "configure" => 600 * MB,
-                "build" => 4 * GB,
+                "clone" => 300 * MB,
+                "python" => 50 * MB,
+                "disasm" or "func_id" or "abi_analysis" => 100 * MB,
+                "recomp" => 300 * MB,
+                "configure" => 300 * MB,
+                "build" => 1 * GB,
                 _ => 0,
             };
         return need + 500 * MB;
@@ -546,7 +549,10 @@ public sealed class Setup
         int total = Directory.Exists(gen) ? Directory.GetFiles(gen, "*.c").Length : 0;
         int compiled = 0;
         var errors = new List<string>();
-        var genFile = new Regex(@"^\s*recomp_[0-9a-z_]+\.c\s*$", RegexOptions.IgnoreCase);
+        // MSBuild prints each source file's name as cl compiles it.
+        var genNames = Directory.Exists(gen)
+            ? Directory.GetFiles(gen, "*.c").Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string?>();
         var error = new Regex(@"\berror (C|LNK|MSB)\d+|fatal error", RegexOptions.IgnoreCase);
         var t0 = DateTime.Now;
         int rc = await _run.RunAsync(cmake, new[] { "--build", BuildDir, "--config", "Release", "--", "/nodeReuse:false" }, ct,
@@ -554,7 +560,7 @@ public sealed class Setup
             {
                 OnLine = line =>
                 {
-                    if (genFile.IsMatch(line) && total > 0)
+                    if (total > 0 && genNames.Remove(line.Trim()))
                     {
                         compiled++;
                         StepProgress?.Invoke(step, Math.Min(0.97, compiled / (double)total),

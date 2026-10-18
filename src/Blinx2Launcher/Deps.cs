@@ -7,6 +7,8 @@ namespace Blinx2Launcher;
 /// <summary>One thing the build needs, how it was found, and how to install it.</summary>
 public sealed class Dependency
 {
+    /// <summary>Short id: git, vs, cmake, python, vcredist.</summary>
+    public required string Id { get; init; }
     public required string Name { get; init; }
     public required string Why { get; init; }
     public bool Found { get; set; }
@@ -245,6 +247,7 @@ public sealed class Toolchain
     {
         Dependencies.Add(new Dependency
         {
+            Id = "git",
             Name = "Git",
             Why = "downloads the project's source code",
             Found = Git != null,
@@ -256,6 +259,7 @@ public sealed class Toolchain
         bool vsOk = VsPath != null && WindowsSdk != null;
         Dependencies.Add(new Dependency
         {
+            Id = "vs",
             Name = "Visual Studio C++ build tools (2022 or newer) + Windows SDK",
             Why = "compiles the game",
             Found = vsOk,
@@ -270,6 +274,7 @@ public sealed class Toolchain
         bool cmakeOk = CMake != null && (VsPath == null || Generator != null);
         Dependencies.Add(new Dependency
         {
+            Id = "cmake",
             Name = $"CMake {MinCMake.Major}.{MinCMake.Minor} or newer",
             Why = "configures the build",
             Found = cmakeOk,
@@ -282,6 +287,7 @@ public sealed class Toolchain
         });
         Dependencies.Add(new Dependency
         {
+            Id = "python",
             Name = "Python 3.10 or newer (3.12 recommended)",
             Why = "runs the recompiler",
             Found = Python != null,
@@ -292,6 +298,7 @@ public sealed class Toolchain
         });
         Dependencies.Add(new Dependency
         {
+            Id = "vcredist",
             Name = "Microsoft Visual C++ Redistributable (x64)",
             Why = "the game needs it to start",
             Found = VcRedist,
@@ -300,5 +307,15 @@ public sealed class Toolchain
             ManualUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe",
             InstallTime = "under a minute",
         });
+
+        // Test hook: BLINX2SETUP_PRETEND_MISSING=git,vs,... reports those as
+        // missing, to try the install path on a PC that has everything.
+        var pretend = Environment.GetEnvironmentVariable("BLINX2SETUP_PRETEND_MISSING");
+        if (!string.IsNullOrEmpty(pretend))
+            foreach (var d in Dependencies.Where(d => pretend.Split(',').Contains(d.Id)))
+            {
+                d.Found = false;
+                d.Detail = "(reported missing for a test: BLINX2SETUP_PRETEND_MISSING)";
+            }
     }
 }
