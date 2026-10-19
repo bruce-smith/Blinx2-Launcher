@@ -56,8 +56,9 @@ public sealed class Setup
 
     public string InstallDir { get; }
     public string IsoPath { get; }
-    public string GameDir => Path.Combine(InstallDir, "game_files");
-    public string RepoDir => Path.Combine(InstallDir, "blinx-2-recompile-full");
+    public string GameDir => _state.GameDir ?? Path.Combine(InstallDir, "game_files");
+    public string RepoDir => _state.RepoDir ?? Path.Combine(InstallDir, "blinx-2-recompile-full");
+    public bool Adopted => _state.RepoDir != null;
     public string XboxRecomp => Path.Combine(RepoDir, "xboxrecomp");
     public string GameProject => Path.Combine(RepoDir, "blinx2-recomp");
     public string BuildDir => Path.Combine(GameProject, "build");
@@ -90,14 +91,14 @@ public sealed class Setup
     /// <summary>Something worth showing that is not an error.</summary>
     public event Action<string>? Warning;
 
-    public Setup(string installDir, string isoPath, Log log, ProcRunner run, Toolchain tc)
+    public Setup(string installDir, string isoPath, Log log, ProcRunner run, Toolchain tc, SetupState? state = null)
     {
         InstallDir = Path.GetFullPath(installDir);
         IsoPath = isoPath;
         _log = log;
         _run = run;
         _tc = tc;
-        _state = SetupState.Load(InstallDir);
+        _state = state ?? SetupState.Load(InstallDir);
 
         Steps = new List<Step>
         {
@@ -110,24 +111,25 @@ public sealed class Setup
             new() { Id = "python", Title = "Set up Python for the recompiler", Typical = TimeSpan.FromMinutes(1),
                     Key = () => CapstoneSpec + "|" + _tc.Python, Run = PythonEnv },
             new() { Id = "xbe_parser", Title = "Recompiler 1/5: read the game's executable", Typical = TimeSpan.FromSeconds(15),
-                    Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.xbe_parser", Xbe, "--json", Path.Combine(GameDir, "mygame_analysis.json")) },
+                    Key = GenKey, Cascade = true, Run = ct => Py(ct, "tools.xbe_parser", Xbe, "--json", Path.Combine(GameDir, "mygame_analysis.json")) },
             new() { Id = "disasm", Title = "Recompiler 2/5: disassemble", Typical = TimeSpan.FromMinutes(1.5),
-                    Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.disasm", Xbe, "--text-only",
+                    Key = GenKey, Cascade = true, Run = ct => Py(ct, "tools.disasm", Xbe, "--text-only",
                         "--extra-sections", ExtraSections,
                         "--seed-functions", Path.Combine(GameProject, "seeds", "seed_functions.json")) },
             new() { Id = "func_id", Title = "Recompiler 3/5: identify library functions", Typical = TimeSpan.FromSeconds(40),
-                    Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.func_id", Xbe, "-v") },
+                    Key = GenKey, Cascade = true, Run = ct => Py(ct, "tools.func_id", Xbe, "-v") },
             new() { Id = "abi_analysis", Title = "Recompiler 4/5: analyse calling conventions", Typical = TimeSpan.FromSeconds(30),
-                    Key = Revision, Cascade = true, Run = ct => Py(ct, "tools.abi_analysis", Xbe, "-v") },
+                    Key = GenKey, Cascade = true, Run = ct => Py(ct, "tools.abi_analysis", Xbe, "-v") },
             new() { Id = "recomp", Title = "Recompiler 5/5: translate the game to C", Typical = TimeSpan.FromMinutes(6),
-                    Key = Revision, Cascade = true, Run = Recomp },
+                    Key = GenKey, Cascade = true, Run = Recomp },
             new() { Id = "configure", Title = "Configure the build (CMake)", Typical = TimeSpan.FromMinutes(1.5),
-                    Key = () => Revision() + "|" + _tc.Generator + "|" + _tc.VsPath, Cascade = true, Run = Configure },
+                    Key = Revision, Cascade = true, Run = Configure },
             new() { Id = "build", Title = "Compile the game", Typical = TimeSpan.FromMinutes(17),
                     Key = Revision, Cascade = true, Run = Build },
             new() { Id = "finish", Title = "Point the game at its files, create shortcuts", Typical = TimeSpan.FromSeconds(5),
                     Key = Revision, Cascade = true, Run = Finish },
         };
+        if (state == null) MigrateKeys();
     }
 
     public void UpdateToolchain(Toolchain tc) => _tc = tc;
@@ -149,7 +151,144 @@ public sealed class Setup
         return _revision = head[..Math.Min(12, head.Length)] + "-" + h;
     }
 
-    private void ForgetRevision() => _revision = null;
+    private void ForgetRevision() { _revision = null; _genKey = null; }
+
+    private string? _genKey;
+
+    /// <summary>Pipeline flags; bump when the commands in the steps change.</summary>
+    private const string PipelineVersion = "pipeline-1";
+
+    /// <summary>
+    /// What the generated C depends on: the recompiler (xboxrecomp's tools),
+    /// the seeds and the manual overrides the recompiler excludes, plus the
+    /// pipeline flags. An update that changes none of them only rebuilds.
+    /// Local edits to those paths count too.
+    /// </summary>
+    public string GenKey()
+    {
+        if (_genKey != null) return _genKey;
+        if (_tc.Git == null || !Directory.Exists(Path.Combine(RepoDir, ".git")) && !File.Exists(Path.Combine(RepoDir, ".git")))
+            return "none";
+        string? G(string dir, params string[] a) => ProcRunner.Capture(_tc.Git, new[] { "-C", dir }.Concat(a))?.Trim();
+        var parts = new[]
+        {
+            G(XboxRecomp, "rev-parse", "HEAD:tools"),
+            G(XboxRecomp, "status", "--porcelain", "--", "tools"),
+            G(GameProject, "rev-parse", "HEAD:seeds"),
+            G(GameProject, "rev-parse", "HEAD:src/recomp_manual.c"),
+            G(GameProject, "status", "--porcelain", "--", "seeds", "src/recomp_manual.c"),
+        };
+        if (parts[0] == null || parts[2] == null || parts[3] == null) return "none";
+        var h = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            PipelineVersion + "\n" + string.Join("\n", parts)))).ToLowerInvariant();
+        return _genKey = "gen-" + h[..16];
+    }
+
+    /// <summary>
+    /// v0.1.0 keyed the recompiler steps on the whole revision. If they were
+    /// done at the revision checked out now, they are done for its generator
+    /// inputs too: rewrite the keys, so the first run of a newer setup does
+    /// not regenerate for nothing.
+    /// </summary>
+    private void MigrateKeys()
+    {
+        if (_state.KeyVersion >= 2) return;
+        var rev = Revision();
+        if (rev != "none")
+        {
+            foreach (var id in new[] { "xbe_parser", "disasm", "func_id", "abi_analysis", "recomp" })
+                if (_state.Done.TryGetValue(id, out var k) && k == rev) _state.Done[id] = GenKey();
+            if (_state.Done.TryGetValue("configure", out var c) && c.StartsWith(rev + "|")) _state.Done["configure"] = rev;
+        }
+        _state.KeyVersion = 2;
+        if (File.Exists(SetupState.FileIn(InstallDir))) _state.Save(InstallDir);
+    }
+
+    private static string AdoptDir(string repoDir)
+    {
+        repoDir = Path.GetFullPath(repoDir).TrimEnd('\\');
+        var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(repoDir.ToLowerInvariant())))[..10].ToLowerInvariant();
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Blinx2Launcher", "installs", Path.GetFileName(repoDir) + "-" + id);
+    }
+
+    /// <summary>
+    /// Takes over an existing clone of the project (not made by this setup):
+    /// the setup's own files go to a folder under %LOCALAPPDATA%, never into
+    /// the clone. What is there is taken as matching the checkout: the
+    /// recompiler and the build rerun only when an update changes their
+    /// inputs. Returns that folder.
+    /// </summary>
+    public static string Adopt(string repoDir, string gameDir, Toolchain tc, Log log)
+    {
+        var dir = AdoptDir(repoDir);
+        var state = SetupState.Load(dir);
+        if (state.RepoDir != null) return dir;
+        state.RepoDir = Path.GetFullPath(repoDir).TrimEnd('\\');
+        state.GameDir = Path.GetFullPath(gameDir);
+        state.KeyVersion = 2;
+        var setup = new Setup(dir, "", log, new ProcRunner(log), tc, state);
+        state.Done["xdvdfs"] = XdvdfsVersion;
+        state.Done["extract"] = "1";
+        state.Done["clone"] = "1";
+        if (File.Exists(Path.Combine(setup.GameProject, "src", "recomp", "gen", "recomp_dispatch.c")))
+            foreach (var sid in new[] { "xbe_parser", "disasm", "func_id", "abi_analysis", "recomp" })
+                state.Done[sid] = setup.GenKey();
+        if (File.Exists(setup.ExePath))
+            foreach (var sid in new[] { "configure", "build" })
+                state.Done[sid] = setup.Revision();
+        state.Save(dir);
+        log.Info($"Adopted the existing clone {state.RepoDir} (game files {state.GameDir}); the setup keeps its own files in {dir}.");
+        return dir;
+    }
+
+    /// <summary>Where the setup keeps its files for a clone it adopted, if it did.</summary>
+    public static string? AdoptedDirFor(string repoDir)
+    {
+        var dir = AdoptDir(repoDir);
+        return File.Exists(SetupState.FileIn(dir)) ? dir : null;
+    }
+
+    /// <summary>The game files of an existing clone: game_files in it (the
+    /// README's layout), the game_dir its settings name, or game_files next
+    /// to it.</summary>
+    public static string? FindGameDir(string repoDir)
+    {
+        var c = new List<string> { Path.Combine(repoDir, "game_files") };
+        var ini = Path.Combine(repoDir, "blinx2-recomp", "build", "Release", "blinx2_settings.ini");
+        if (File.Exists(ini))
+            foreach (var l in File.ReadAllLines(ini))
+            {
+                var m = Regex.Match(l, @"^\s*game_dir\s*=\s*(.+?)\s*$");
+                if (m.Success) c.Add(m.Groups[1].Value);
+            }
+        var parent = Path.GetDirectoryName(Path.GetFullPath(repoDir));
+        if (parent != null) c.Add(Path.Combine(parent, "game_files"));
+        return c.FirstOrDefault(d => File.Exists(Path.Combine(d, "default.xbe")));
+    }
+
+    /// <summary>
+    /// Resolves what the user pointed at: a folder made by this setup (it
+    /// holds setup_state.json), a clone of the project the setup already
+    /// adopted, or a fresh clone (returned as adoptable with its game files,
+    /// if found). Folders holding a setup install or a clone one level down
+    /// are recognised too.
+    /// </summary>
+    public static (string? installDir, string? cloneToAdopt) Resolve(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path)) return (null, null);
+        path = Path.GetFullPath(path);
+        if (File.Exists(SetupState.FileIn(path))) return (path, null);
+        foreach (var repo in new[] { path, Path.Combine(path, "blinx-2-recompile-full") })
+        {
+            if (!Updater.IsProjectClone(repo)) continue;
+            var parent = Path.GetDirectoryName(repo);
+            if (parent != null && File.Exists(SetupState.FileIn(parent)) && repo.EndsWith("blinx-2-recompile-full", StringComparison.OrdinalIgnoreCase))
+                return (parent, null);
+            return AdoptedDirFor(repo) is { } d ? (d, null) : (null, repo);
+        }
+        return (null, null);
+    }
 
     /// <summary>The steps that will run (for the estimate and the disk check).</summary>
     public List<Step> Pending()
@@ -244,16 +383,24 @@ public sealed class Setup
         }
     }
 
-    /// <summary>Pulls the latest project commits; the next run then
-    /// regenerates and rebuilds whatever they change.</summary>
-    public async Task UpdateAsync(CancellationToken ct)
+    /// <summary>The updater for this install's clone; null before it is cloned.</summary>
+    public Updater? MakeUpdater() =>
+        _tc.Git != null && Updater.IsProjectClone(RepoDir) ? new Updater(_tc.Git, RepoDir, _log, _run) : null;
+
+    /// <summary>Moves the clone to the latest commits (see Updater); the run
+    /// after it regenerates only if the generator inputs changed, and
+    /// rebuilds if anything changed. Returns the stashes made, if any.</summary>
+    public async Task<List<string>> UpdateAsync(Updater.Status status, bool stash, CancellationToken ct)
     {
-        if (_tc.Git == null) throw new SetupException("Git is not installed.");
+        var u = MakeUpdater() ?? throw new SetupException("There is no clone of the project to update yet.");
         _log.Info("== Update the project source");
-        await _run.RunCheckedAsync(_tc.Git, new[] { "-C", RepoDir, "pull", "--ff-only" }, ct, what: "git pull");
-        await _run.RunCheckedAsync(_tc.Git, new[] { "-C", RepoDir, "submodule", "update", "--init", "--recursive" }, ct,
-            what: "git submodule update");
+        var genBefore = GenKey();
+        var stashes = await u.ApplyAsync(status, stash, ct);
         ForgetRevision();
+        _log.Info(GenKey() == genBefore
+            ? "The recompiler's inputs (xboxrecomp tools, seeds, manual overrides) did not change: no regeneration needed."
+            : "The recompiler's inputs changed: the game's code will be regenerated.");
+        return stashes;
     }
 
     private void MarkCreated(string dir)
@@ -478,6 +625,7 @@ public sealed class Setup
             var f = (DateTime.Now - t0).TotalSeconds / step.Typical.TotalSeconds;
             StepProgress?.Invoke(step, Math.Min(0.95, f), null);
         }, null, 1000, 5000);
+        var before = SnapshotGen(gen);
         await Py(ct, "tools.recomp", Xbe, "--all", "--split", "250",
             "--gen-dir", gen,
             "--exclude-manual", Path.Combine(GameProject, "src", "recomp_manual.c"),
@@ -486,6 +634,7 @@ public sealed class Setup
             "--loop-heads");
         if (!File.Exists(Path.Combine(gen, "recomp_dispatch.c")))
             throw new SetupException("The recompiler finished but wrote no recomp_dispatch.c.");
+        RestoreUnchangedTimes(gen, before);
 
         var summary = Path.Combine(XboxRecomp, "tools", "recomp", "output", "summary.json");
         try
@@ -505,40 +654,79 @@ public sealed class Setup
         }
     }
 
+    /// <summary>Size, hash and time of every generated file.</summary>
+    private static Dictionary<string, (long len, string sha, DateTime time)> SnapshotGen(string gen)
+    {
+        var d = new Dictionary<string, (long, string, DateTime)>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(gen)) return d;
+        foreach (var f in Directory.GetFiles(gen))
+        {
+            var fi = new FileInfo(f);
+            d[fi.Name] = (fi.Length, Util.Sha256File(f), fi.LastWriteTimeUtc);
+        }
+        return d;
+    }
+
+    /// <summary>
+    /// The recompiler rewrites every generated file. Files whose content did
+    /// not change get their old time back, so MSBuild recompiles only the
+    /// ones that did (a seed or lifter change usually touches a few).
+    /// </summary>
+    private void RestoreUnchangedTimes(string gen, Dictionary<string, (long len, string sha, DateTime time)> before)
+    {
+        int same = 0, changed = 0;
+        foreach (var f in Directory.GetFiles(gen))
+        {
+            var fi = new FileInfo(f);
+            if (before.TryGetValue(fi.Name, out var b) && b.len == fi.Length && b.sha == Util.Sha256File(f))
+            {
+                File.SetLastWriteTimeUtc(f, b.time);
+                same++;
+            }
+            else changed++;
+        }
+        if (before.Count > 0)
+            _log.Info($"Generated files: {changed} new or changed, {same} unchanged (kept their times, so they are not recompiled).");
+    }
+
     // ---- Build -------------------------------------------------------------
 
     private async Task Configure(CancellationToken ct)
     {
         var cmake = _tc.CMake ?? throw new SetupException("CMake is not installed.");
-        if (_tc.Generator == null || _tc.VsPath == null)
-            throw new SetupException("No Visual Studio C++ tools that CMake can use were found.");
+        var args = new List<string> { "-S", GameProject, "-B", BuildDir };
 
-        // A build folder made with another generator or Visual Studio cannot be
-        // reused: drop the cache (the settings file next to the exe stays).
+        // An existing build folder keeps the generator and Visual Studio it
+        // was made with (an update must not start a working build over), as
+        // long as that Visual Studio is still installed.
         var cache = Path.Combine(BuildDir, "CMakeCache.txt");
+        bool reuse = false;
         if (File.Exists(cache))
         {
             var text = File.ReadAllText(cache);
             var gen = Regex.Match(text, @"^CMAKE_GENERATOR:INTERNAL=(.*)$", RegexOptions.Multiline).Groups[1].Value.Trim();
             var inst = Regex.Match(text, @"^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.*)$", RegexOptions.Multiline).Groups[1].Value.Trim();
-            if (gen != _tc.Generator || !string.Equals(Path.GetFullPath(inst.Length > 0 ? inst : "."),
-                    Path.GetFullPath(_tc.VsPath), StringComparison.OrdinalIgnoreCase))
+            reuse = gen.Length > 0 && (inst.Length == 0 || Directory.Exists(inst));
+            if (reuse)
+                _log.Info($"Reusing the build folder's configuration ({gen}{(inst.Length > 0 ? ", " + inst : "")}).");
+            else
             {
-                _log.Info($"The build folder was configured for {gen} ({inst}); starting it over for {_tc.Generator}.");
+                _log.Info($"The build folder was configured for {gen} ({inst}), which is no longer installed; starting it over.");
                 File.Delete(cache);
                 var cf = Path.Combine(BuildDir, "CMakeFiles");
                 if (Directory.Exists(cf)) Directory.Delete(cf, true);
             }
         }
-        await _run.RunCheckedAsync(cmake, new[]
+        if (!reuse)
         {
-            "-S", GameProject, "-B", BuildDir,
-            "-G", _tc.Generator, "-A", "x64",
-            "-DCMAKE_GENERATOR_INSTANCE=" + _tc.VsPath,
-            // The exe also reads game_dir from blinx2_settings.ini (written in
-            // the last step); this is the fallback baked into it.
-            "-DBLINX2_GAME_DIR=" + Util.ForwardSlashes(GameDir),
-        }, ct, what: "CMake configure");
+            if (_tc.Generator == null || _tc.VsPath == null)
+                throw new SetupException("No Visual Studio C++ tools that CMake can use were found.");
+            args.AddRange(new[] { "-G", _tc.Generator, "-A", "x64", "-DCMAKE_GENERATOR_INSTANCE=" + _tc.VsPath });
+        }
+        // The exe also reads game_dir from blinx2_settings.ini (written in the
+        // last step); this is the fallback baked into it.
+        args.Add("-DBLINX2_GAME_DIR=" + Util.ForwardSlashes(GameDir));
+        await _run.RunCheckedAsync(cmake, args, ct, what: "CMake configure");
     }
 
     private async Task Build(CancellationToken ct)

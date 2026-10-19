@@ -11,6 +11,13 @@ namespace Blinx2Launcher;
 public sealed class SetupState
 {
     public string? IsoPath { get; set; }
+    /// <summary>Set for an existing clone the setup adopted (it lives
+    /// elsewhere; this folder only holds the setup's own files).</summary>
+    public string? RepoDir { get; set; }
+    public string? GameDir { get; set; }
+    /// <summary>How the step keys are computed (2 since v0.2.0: the
+    /// recompiler steps depend on the generator inputs only).</summary>
+    public int KeyVersion { get; set; } = 1;
     public Dictionary<string, string> Done { get; set; } = new();
     /// <summary>Folders this setup created and may delete to retry a step.</summary>
     public List<string> Created { get; set; } = new();

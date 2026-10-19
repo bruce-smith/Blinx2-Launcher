@@ -23,8 +23,19 @@ public sealed class MainForm : Form
     private readonly TextBox _iso = new() { Width = 520 };
     private readonly TextBox _dir = new() { Width = 520 };
     private readonly Label _chooseInfo = new() { AutoSize = true, MaximumSize = new Size(760, 0) };
-    private readonly CheckBox _update = new() { Text = "Update to the latest version of the project first", AutoSize = true, Visible = false };
+    private readonly LinkLabel _selfUpdate = new() { AutoSize = true, Visible = false, Padding = new Padding(0, 0, 0, 8) };
+    private readonly GroupBox _installBox = new() { Text = "Installed", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Visible = false, Padding = new Padding(10), MinimumSize = new Size(780, 0) };
+    private readonly Label _installStatus = new() { AutoSize = true, MaximumSize = new Size(760, 0) };
+    private readonly Button _updateBtn = new() { Text = "Update", AutoSize = true, Enabled = false };
+    private readonly Button _checkBtn = new() { Text = "Check for updates", AutoSize = true };
     private readonly Button _play1 = new() { Text = "Play", AutoSize = true, Visible = false };
+    private readonly Button _next = new() { Text = "Next", AutoSize = true };
+
+    // What the folder box points at: an install (setup folder, or the
+    // setup's folder for an adopted clone), or a clone not adopted yet.
+    private string? _resolvedInstall, _cloneToAdopt, _checkedFor;
+    private Updater.Status? _upd;
+    private bool _doUpdate, _stash;
 
     // Page 2
     private readonly Panel _pageDeps = new() { Dock = DockStyle.Fill };
@@ -84,6 +95,15 @@ public sealed class MainForm : Form
         _iso.Text = saved.IsoPath ?? "";
         RefreshChooseInfo();
         FormClosing += OnClosing;
+        Shown += async (_, _) =>
+        {
+            if (await ReleaseCheck.NewerAsync() is { } rel)
+            {
+                _selfUpdate.Text = $"A newer version of this setup is available ({rel.Tag}). Download it";
+                _selfUpdate.LinkClicked += (_, _) => OpenUrl(rel.Url);
+                _selfUpdate.Visible = true;
+            }
+        };
     }
 
     private void ShowPage(Panel p)
@@ -96,6 +116,7 @@ public sealed class MainForm : Form
     private void BuildChoosePage()
     {
         var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true };
+        flow.Controls.Add(_selfUpdate);
         flow.Controls.Add(new Label
         {
             Text = "Blinx 2: Masters of Time and Space, recompiled for Windows",
@@ -136,7 +157,7 @@ public sealed class MainForm : Form
         isoRow.Controls.Add(bIsoDir);
         flow.Controls.Add(isoRow);
 
-        flow.Controls.Add(new Label { Text = "Install folder (the game, its source and the build go here):", AutoSize = true, Padding = new Padding(0, 10, 0, 0) });
+        flow.Controls.Add(new Label { Text = "Install folder (the game, its source and the build go here), or an existing install to update:", AutoSize = true, Padding = new Padding(0, 10, 0, 0) });
         var dirRow = Row();
         dirRow.Controls.Add(_dir);
         var bDir = new Button { Text = "Choose...", AutoSize = true };
@@ -154,64 +175,187 @@ public sealed class MainForm : Form
             }
         };
         dirRow.Controls.Add(bDir);
+        var bExisting = new Button { Text = "Find existing install...", AutoSize = true };
+        bExisting.Click += (_, _) =>
+        {
+            using var d = new FolderBrowserDialog
+            {
+                Description = "The folder of an existing install (or your clone of blinx-2-recompile-full)",
+                UseDescriptionForTitle = true,
+            };
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            if (Setup.Resolve(d.SelectedPath) is (null, null))
+            {
+                Error("That folder is not a Blinx 2 install made by this setup, nor a clone of blinx-2-recompile-full.");
+                return;
+            }
+            _dir.Text = d.SelectedPath;
+            RefreshChooseInfo();
+        };
+        dirRow.Controls.Add(bExisting);
         flow.Controls.Add(dirRow);
         _iso.Leave += (_, _) => RefreshChooseInfo();
         _dir.Leave += (_, _) => RefreshChooseInfo();
 
-        flow.Controls.Add(_update);
         _chooseInfo.Padding = new Padding(0, 10, 0, 10);
         flow.Controls.Add(_chooseInfo);
 
-        var buttons = Row();
-        var next = new Button { Text = "Next", AutoSize = true };
-        next.Click += (_, _) => OnChooseNext();
+        var box = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true };
+        box.Controls.Add(_installStatus);
+        var boxButtons = Row();
+        boxButtons.Padding = new Padding(0, 8, 0, 0);
+        boxButtons.Controls.Add(_updateBtn);
+        boxButtons.Controls.Add(_checkBtn);
+        boxButtons.Controls.Add(_play1);
+        box.Controls.Add(boxButtons);
+        _installBox.Controls.Add(box);
+        flow.Controls.Add(_installBox);
+        _updateBtn.Click += (_, _) => OnUpdate();
+        _checkBtn.Click += async (_, _) => { _checkedFor = null; await CheckForUpdate(); };
         _play1.Click += (_, _) => Play();
-        buttons.Controls.Add(next);
-        buttons.Controls.Add(_play1);
+
+        var buttons = Row();
+        buttons.Padding = new Padding(0, 10, 0, 0);
+        _next.Click += (_, _) => OnChooseNext();
+        buttons.Controls.Add(_next);
         flow.Controls.Add(buttons);
-        AcceptButton = next;
+        AcceptButton = _next;
         _pageChoose.Controls.Add(flow);
     }
 
     private static FlowLayoutPanel Row() => new() { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0) };
 
-    private string InstallDir => Path.GetFullPath(_dir.Text.Trim().Trim('"'));
+    /// <summary>The install the run uses: the resolved one, else the typed folder (a new install).</summary>
+    private string InstallDir => _resolvedInstall ?? Path.GetFullPath(_dir.Text.Trim().Trim('"'));
 
     private void RefreshChooseInfo()
     {
         var sb = new StringBuilder();
+        var text = _dir.Text.Trim().Trim('"');
         try
         {
-            if (Program.CheckInstallDir(_dir.Text.Trim().Trim('"')) is { } bad) { _chooseInfo.Text = bad; return; }
+            (_resolvedInstall, _cloneToAdopt) = Setup.Resolve(text);
+            if (_resolvedInstall == null && _cloneToAdopt == null)
+            {
+                _installBox.Visible = false;
+                if (Program.CheckInstallDir(text) is { } bad) { _chooseInfo.Text = bad; return; }
+            }
             var dir = InstallDir;
             var state = SetupState.Load(dir);
-            bool installed = File.Exists(Path.Combine(dir, @"blinx-2-recompile-full\blinx2-recomp\build\Release\blinx_2_recomp.exe"));
-            bool cloned = Directory.Exists(Path.Combine(dir, @"blinx-2-recompile-full\.git"));
-            bool extracted = File.Exists(Path.Combine(dir, @"game_files\default.xbe"));
+            var repo = _cloneToAdopt ?? state.RepoDir ?? Path.Combine(dir, "blinx-2-recompile-full");
+            var exe = Path.Combine(repo, @"blinx2-recomp\build\Release\blinx_2_recomp.exe");
+            var gameDir = state.GameDir ?? (_cloneToAdopt != null ? Setup.FindGameDir(_cloneToAdopt) : null) ?? Path.Combine(dir, "game_files");
+            bool installed = File.Exists(exe);
+            bool cloned = Updater.IsProjectClone(repo);
+            bool extracted = File.Exists(Path.Combine(gameDir, "default.xbe"));
             if (state.IsoPath != null && _iso.Text.Length == 0) _iso.Text = state.IsoPath;
-            _update.Visible = cloned;
+
+            _installBox.Visible = cloned;
             _play1.Visible = installed;
-            if (installed) sb.AppendLine("Blinx 2 is installed in this folder. Next checks it (and updates it if ticked).");
+            _installBox.Text = _cloneToAdopt != null ? "Existing clone of the project" : installed ? "Installed" : "Partly installed";
+            if (cloned && _checkedFor != repo) _ = CheckForUpdate();
+
+            if (_cloneToAdopt != null)
+                sb.AppendLine($"{_cloneToAdopt} is a clone of the project that this setup did not make. It can update and build it " +
+                              "in place (its own files go to %LOCALAPPDATA%\\Blinx2Launcher)." +
+                              (extracted ? $" Game files: {gameDir}." : " Its game files were not found; you will be asked for them."));
+            else if (installed) sb.AppendLine($"Blinx 2 is installed here ({repo}). Next checks and repairs it; Update gets the latest version.");
             else if (state.Done.Count > 0) sb.AppendLine($"A setup in this folder stopped part-way ({state.Done.Count} steps done); Next continues it.");
-            if (extracted) sb.AppendLine("The game files are already extracted here; the disc image is not needed again.");
-            long free = Cli.FreeSpace(dir);
+            if (extracted && _cloneToAdopt == null) sb.AppendLine("The game files are already extracted; the disc image is not needed again.");
+            long free = Cli.FreeSpace(_cloneToAdopt ?? state.RepoDir ?? dir);
             var iso = Setup.ResolveIso(_iso.Text.Trim().Trim('"'), out _) ?? "";
-            long need = installed ? 0 : new Setup(dir, iso, _log, _runner, _tc ?? new Toolchain()).SpaceNeeded(null);
-            sb.AppendLine($"Free space on {Path.GetPathRoot(dir)}: {Util.FormatSize(free)}" +
+            long need = installed || _cloneToAdopt != null ? 0 : new Setup(dir, iso, _log, _runner, _tc ?? new Toolchain()).SpaceNeeded(null);
+            sb.AppendLine($"Free space on {Path.GetPathRoot(_cloneToAdopt ?? state.RepoDir ?? dir)}: {Util.FormatSize(free)}" +
                           (need > 0 ? $" (a full setup needs about {Util.FormatSize(need)})" : ""));
             if (need > free) sb.AppendLine("Not enough free space: choose another drive or free some space.");
         }
-        catch (Exception e) { sb.AppendLine(e.Message); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            sb.AppendLine(e.Message);
+        }
         _chooseInfo.Text = sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Fetches and shows installed vs latest for the clone the folder box points at.</summary>
+    private async Task CheckForUpdate()
+    {
+        var state = _resolvedInstall != null ? SetupState.Load(_resolvedInstall) : new SetupState();
+        var repo = _cloneToAdopt ?? state.RepoDir ?? Path.Combine(InstallDir, "blinx-2-recompile-full");
+        if (!Updater.IsProjectClone(repo)) return;
+        _checkedFor = repo;
+        _installStatus.Text = "Checking for updates...";
+        _updateBtn.Enabled = false;
+        _checkBtn.Enabled = false;
+        try
+        {
+            var git = await Task.Run(() => (_tc ?? Toolchain.Detect()).Git);
+            if (git == null) { _installStatus.Text = "Git is not installed, so updates cannot be checked."; return; }
+            var u = new Updater(git, repo, _log, _runner);
+            _upd = await u.CheckAsync(fetch: true, CancellationToken.None);
+            if (_checkedFor != repo) return;   // the folder changed meanwhile
+            _installStatus.Text = _upd.Describe();
+            _updateBtn.Enabled = _upd.UpdateAvailable && _upd.Blockers.Count == 0;
+            _updateBtn.Text = _upd.UpdateAvailable ? $"Update ({_upd.Behind} new)" : "Up to date";
+        }
+        catch (Exception e) when (e is SetupException or IOException)
+        {
+            _installStatus.Text = "Could not check for updates: " + e.Message;
+        }
+        finally { _checkBtn.Enabled = true; }
+    }
+
+    /// <summary>Takes over a clone this setup did not make; asks for its game
+    /// files if they are not next to it. False if the user cancelled.</summary>
+    private bool AdoptClone()
+    {
+        if (_cloneToAdopt == null) return true;
+        var gameDir = Setup.FindGameDir(_cloneToAdopt);
+        if (gameDir == null)
+        {
+            using var d = new FolderBrowserDialog { Description = "The game files for this clone (the folder with default.xbe)", UseDescriptionForTitle = true };
+            if (d.ShowDialog(this) != DialogResult.OK) return false;
+            if (!File.Exists(Path.Combine(d.SelectedPath, "default.xbe"))) { Error("That folder has no default.xbe."); return false; }
+            gameDir = d.SelectedPath;
+        }
+        _resolvedInstall = Setup.Adopt(_cloneToAdopt, gameDir, _tc ?? Toolchain.Detect(), _log);
+        _cloneToAdopt = null;
+        return true;
+    }
+
+    private void OnUpdate()
+    {
+        if (_upd == null || !_upd.UpdateAvailable) return;
+        if (_upd.Blockers.Count > 0) { Error("This copy cannot be updated automatically:\r\n\r\n" + string.Join("\r\n", _upd.Blockers)); return; }
+        _stash = false;
+        if (_upd.Dirty.Count > 0)
+        {
+            var r = MessageBox.Show(this,
+                "There are local changes to the project's files in: " + string.Join(", ", _upd.Dirty) + ".\r\n\r\n" +
+                "Yes: save them with \"git stash\" (they are kept, and can be restored with \"git stash apply\"), then update.\r\n" +
+                "No: do not update.", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (r != DialogResult.Yes) return;
+            _stash = true;
+        }
+        if (!AdoptClone()) return;
+        _doUpdate = true;
+        GoToDeps("");
     }
 
     private void OnChooseNext()
     {
         RefreshChooseInfo();
+        _doUpdate = false;
+        if (_cloneToAdopt != null)
+        {
+            if (!AdoptClone()) return;
+            GoToDeps("");
+            return;
+        }
         var dirText = _dir.Text.Trim().Trim('"');
-        if (Program.CheckInstallDir(dirText) is { } bad) { Error(bad); return; }
+        if (_resolvedInstall == null && Program.CheckInstallDir(dirText) is { } bad) { Error(bad); return; }
         var dir = InstallDir;
-        bool extracted = File.Exists(Path.Combine(dir, @"game_files\default.xbe"));
+        var state = SetupState.Load(dir);
+        bool extracted = File.Exists(Path.Combine(state.GameDir ?? Path.Combine(dir, "game_files"), "default.xbe"));
         string iso = "";
         if (!extracted || _iso.Text.Trim().Length > 0)
         {
@@ -220,14 +364,22 @@ public sealed class MainForm : Form
             iso = r ?? "";
             if (r != null) _iso.Text = r;
         }
-        if (Directory.Exists(dir) && !File.Exists(SetupState.FileIn(dir)) && Directory.EnumerateFileSystemEntries(dir).Any())
+        if (_resolvedInstall == null && Directory.Exists(dir) && Directory.EnumerateFileSystemEntries(dir).Any())
         {
             if (MessageBox.Show(this, $"{dir} is not empty. Install into it anyway?", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         }
-        LauncherSettings.Save(new LauncherSettings.Data { InstallDir = dir, IsoPath = iso.Length > 0 ? iso : null });
+        GoToDeps(iso);
+    }
+
+    private void GoToDeps(string iso)
+    {
+        var dir = InstallDir;
+        var state = SetupState.Load(dir);
+        LauncherSettings.Save(new LauncherSettings.Data { InstallDir = state.RepoDir ?? dir, IsoPath = iso.Length > 0 ? iso : null });
         _log.OpenFile(Path.Combine(dir, "setup.log"));
-        _log.Info($"Install folder {dir}, disc image {(iso.Length > 0 ? iso : "(already extracted)")}");
+        _log.Info($"Install {dir}" + (state.RepoDir != null ? $" (clone {state.RepoDir})" : "") +
+                  $", disc image {(iso.Length > 0 ? iso : "(already extracted)")}" + (_doUpdate ? ", updating" : ""));
         _isoResolved = iso;
         ShowPage(_pageDeps);
         CheckDeps();
@@ -380,6 +532,7 @@ public sealed class MainForm : Form
         _cancel.Text = "Cancel";
         _warnings.Clear();
         _setup = new Setup(InstallDir, _isoResolved, _log, _runner, _tc);
+        var stashes = new List<string>();
         _setup.StepStarted += (s, run) => BeginInvoke(() => OnStepStarted(s, run));
         _setup.StepFinished += (s, ok) => BeginInvoke(() => OnStepFinished(s, ok));
         _setup.StepProgress += (s, f, note) => BeginInvoke(() => { if (s == _current) { _currentFrac = f; _currentNote = note; } });
@@ -399,14 +552,18 @@ public sealed class MainForm : Form
         _runStart = DateTime.Now;
         try
         {
-            if (_update.Checked && _update.Visible)
+            if (_doUpdate)
             {
                 _status.Text = "Updating the project source...";
-                await _setup.UpdateAsync(_cts.Token);
-                _update.Checked = false;
+                var u = _setup.MakeUpdater() ?? throw new SetupException("There is no clone of the project to update.");
+                var st = await u.CheckAsync(fetch: true, _cts.Token);
+                stashes = await _setup.UpdateAsync(st, _stash, _cts.Token);
+                foreach (var x in stashes) _warnings.Add("Your local changes were saved: " + x);
+                _doUpdate = false;
+                _checkedFor = null;
             }
             var pending = _setup.Pending();
-            long need = _setup.SpaceNeeded(pending), free = Cli.FreeSpace(InstallDir);
+            long need = _setup.SpaceNeeded(pending), free = Cli.FreeSpace(_setup.RepoDir);
             _log.Info($"{pending.Count} of {_setup.Steps.Count} steps to run, about {Util.FormatDuration(_setup.Estimate(pending))}; " +
                       $"needs about {Util.FormatSize(need)} of disk, {Util.FormatSize(free)} free.");
             foreach (var s in _setup.Steps.Except(pending)) _stepItems[s.Id].SubItems[0].Text = "done";
@@ -549,7 +706,8 @@ public sealed class MainForm : Form
 
     private void Play()
     {
-        var exe = _setup?.ExePath ?? Path.Combine(InstallDir, @"blinx-2-recompile-full\blinx2-recomp\build\Release\blinx_2_recomp.exe");
+        var repo = _cloneToAdopt ?? SetupState.Load(InstallDir).RepoDir ?? Path.Combine(InstallDir, "blinx-2-recompile-full");
+        var exe = _setup?.ExePath ?? Path.Combine(repo, @"blinx2-recomp\build\Release\blinx_2_recomp.exe");
         if (!File.Exists(exe)) { Error("The game is not built yet."); return; }
         Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(exe) });
     }

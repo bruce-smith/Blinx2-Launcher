@@ -63,10 +63,45 @@ Double-click `Blinx2Setup.exe`. It needs no .NET installation.
 - **Something went wrong?** The window shows the error. "Copy log" copies
   the tool versions, the steps and the end of the log for a bug report, and
   the full log is `<install>\setup.log`.
-- **Updating:** run "Blinx 2 Setup (update or repair)" from the Start menu
-  and tick "Update to the latest version". It pulls the newest project
-  commits, then reruns the recompiler and the build if anything changed.
-  Your saves stay in `<install>\game_files\UDATA`.
+- **Updating:** see "Updating" below.
+- **A newer setup?** The window says so at the top and links the release.
+
+## Updating
+
+Open the setup again: "Blinx 2 Setup (update or repair)" in the Start menu,
+or `Blinx2Setup.exe` itself. It finds the install you used last. Point the
+folder box at another one, or use "Find existing install..." for an
+install elsewhere or for **your own clone** of blinx-2-recompile-full. The
+"Installed" box shows the installed commits (the project and its
+submodules) against the latest on GitHub, with the new commits listed.
+"Update" then:
+
+1. Fast-forwards the project to `origin/main` and updates the submodules to
+   the commits it pins (`git submodule sync` + `update --init --recursive`).
+   It stops with a message and changes nothing in these cases:
+   - you have local changes to tracked files (unless you agree to have them
+     saved with `git stash push -m blinx2setup-update-<time>`; the stash is
+     never dropped, restore it with `git stash apply`);
+   - you have local commits, or another branch is checked out;
+   - a submodule is on a commit that no branch contains.
+2. Regenerates the C **only if the recompiler's inputs changed**: xboxrecomp's
+   `tools/`, blinx2-recomp's `seeds/` and `src/recomp_manual.c`. Generated
+   files whose content did not change keep their old timestamps, so the
+   compiler only rebuilds the ones that did.
+3. Reconfigures and rebuilds Release, keeping the build folder's generator.
+4. Rewrites `game_dir` in `blinx2_settings.ini` (every other line stays) and
+   refreshes the shortcuts.
+
+Never touched: the game files and your saves (`UDATA`, `TDATA`), the
+settings file's other lines, `recordings\`, the game's cache
+(`%LOCALAPPDATA%\xboxrecomp`), and any untracked file in the clone. A
+second update with nothing new does nothing.
+
+For a clone the setup did not make, its own files (log, state, Python
+environment) go to `%LOCALAPPDATA%\Blinx2Launcher\installs\`, never into
+the clone. The game files are looked for in the clone's `game_files`, then
+in the `game_dir` of its settings file, then next to it. If none of those
+has them, the setup asks.
 
 Install folder layout:
 
@@ -91,21 +126,29 @@ The same setup runs without the window:
 
 ```
 Blinx2Setup.exe --cli --iso <file or folder> [--dir <install folder>]
-                [--yes] [--dry-run] [--no-shortcuts] [--update]
+                [--yes] [--dry-run] [--no-shortcuts]
+Blinx2Setup.exe --cli --check-update [--dir <install or clone>]
+Blinx2Setup.exe --cli --update [--stash] [--dir <install or clone>]
+Blinx2Setup.exe --cli --update --repo <your clone> [--game-dir <dir>]
 ```
 
 - `--yes` installs missing tools without asking.
 - `--dry-run` only reports what is installed, what it would install (the
   exact winget commands) and which steps would run.
-- `--update` pulls the newest project commits first.
+- `--check-update` shows installed against latest. It exits with 10 when an
+  update exists.
+- `--update` updates as described above. `--stash` agrees to stash local
+  changes.
+- `--repo` and `--game-dir` take over an existing clone and its game files.
 
 For testing the install path on a PC that already has everything:
 `BLINX2SETUP_PRETEND_MISSING=git,vs,cmake,python,vcredist` reports those as
 missing, `BLINX2SETUP_DRY_INSTALL=1` logs the winget commands instead of
 running them, and `BLINX2SETUP_SHORTCUT_DIR=<dir>` puts the shortcuts there.
 
-Exit codes: 0 done, 1 a step failed, 2 bad arguments, 3 tools missing,
-4 not enough disk space, 5 cancelled.
+Exit codes: 0 done (or up to date), 1 a step failed, 2 bad arguments,
+3 tools missing, 4 not enough disk space, 5 cancelled, 6 update refused
+(local changes or commits), 10 update available (`--check-update`).
 
 ## Building the setup itself
 
@@ -121,14 +164,18 @@ The result is `dist\Blinx2Setup.exe`, a single self-contained file (about
 Code map (`src/Blinx2Launcher`):
 
 - `MainForm.cs`: the window (three pages: choose, tools, progress).
-- `Program.cs`: the entry point, the `--cli` mode and the folder checks.
+- `Program.cs`: the entry point and the folder checks. `Cli.cs`: the
+  `--cli` mode.
+- `Updater.cs`: installed against latest, the update itself, and the check
+  for a newer setup release.
 - `Deps.cs`: finding Git, CMake, Visual Studio (through vswhere, with the
   matching CMake generator), Python, the Windows SDK and the VC++ runtime.
 - `DepInstaller.cs`: the winget commands.
 - `Setup.cs`: the steps. The pipeline flags live here; keep them in step
   with the project's README.
-- `SetupState.cs`: resuming. A step reruns when its key changes, so after an
-  update the pipeline and the build run again.
+- `SetupState.cs`: resuming. A step reruns when its key changes. The
+  recompiler steps are keyed on the generator inputs, the build on the
+  whole revision.
 - `ProcRunner.cs`: child processes in a job object. Cancel and close stop
   only the setup's own processes.
 

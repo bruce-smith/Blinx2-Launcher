@@ -14,7 +14,16 @@ Blinx2Setup.exe --cli --iso <file|folder> [--dir <install folder>] [options]
   --yes            install missing dependencies without asking
   --dry-run        detect and print what would be installed and run; change nothing
   --no-shortcuts   do not create desktop/Start-menu shortcuts
-  --update         pull the latest project commits first, then rebuild what changed";
+Updating an install (--dir: the install folder, or a clone of the project):
+Blinx2Setup.exe --cli --check-update [--dir <folder>]    exit code 10 if an update exists
+Blinx2Setup.exe --cli --update [--stash] [--dir <folder>]
+  --update         fetch the latest project commits, update the clone and its
+                   submodules, regenerate only if the recompiler's inputs
+                   changed, and rebuild
+  --stash          save local changes with git stash (never dropped) instead
+                   of refusing to update
+  --repo <clone>   use an existing clone of blinx-2-recompile-full
+  --game-dir <dir> its game files, if not found next to it";
 
     [STAThread]
     public static int Main(string[] args)
@@ -46,127 +55,3 @@ Blinx2Setup.exe --cli --iso <file|folder> [--dir <install folder>] [options]
     }
 }
 
-/// <summary>The --cli mode: the same setup without the window, for scripted
-/// tests and for people who prefer a console.</summary>
-public static class Cli
-{
-    public static async Task<int> Run(string[] args)
-    {
-        if (args.Contains("--help") || args.Contains("-h") || args.Contains("/?"))
-        {
-            Console.WriteLine(Program.Usage);
-            return 0;
-        }
-        string? Arg(string name)
-        {
-            int i = Array.IndexOf(args, name);
-            return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
-        }
-        bool yes = args.Contains("--yes"), dry = args.Contains("--dry-run");
-        var dir = Path.GetFullPath(Arg("--dir") ?? Util.DefaultInstallDir());
-        var isoArg = Arg("--iso");
-
-        using var log = new Log();
-        log.Line += l => Console.WriteLine(l);
-        if (Program.CheckInstallDir(dir) is { } bad) { log.Error(bad); return 2; }
-        if (!dry) log.OpenFile(Path.Combine(dir, "setup.log"));
-
-        var state = SetupState.Load(dir);
-        isoArg ??= state.IsoPath;
-        string? iso = null;
-        if (isoArg != null)
-        {
-            iso = Setup.ResolveIso(isoArg, out var problem);
-            if (iso == null && !File.Exists(Path.Combine(dir, "game_files", "default.xbe")))
-            {
-                log.Error(problem ?? "No disc image.");
-                return 2;
-            }
-        }
-        else if (!File.Exists(Path.Combine(dir, "game_files", "default.xbe")))
-        {
-            log.Error("Pass --iso <your Blinx 2 .iso/.xiso>.");
-            Console.WriteLine(Program.Usage);
-            return 2;
-        }
-
-        log.Info($"Blinx 2 setup {Program.Version}: install folder {dir}, disc image {iso ?? "(already extracted)"}");
-        log.Info("Checking dependencies:");
-        var tc = Toolchain.Detect(log);
-        var missing = tc.Dependencies.Where(d => !d.Found).ToList();
-        var runner = new ProcRunner(log);
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-
-        if (missing.Count > 0)
-        {
-            if (!tc.Winget && !dry)
-            {
-                log.Error("winget is not available; install these by hand: " +
-                          string.Join("; ", missing.Select(d => $"{d.Name}: {d.ManualUrl}")));
-                return 3;
-            }
-            if (!yes && !dry)
-            {
-                log.Error("Missing dependencies (run again with --yes to install them with winget):");
-                foreach (var d in missing) log.Info("  " + DepInstaller.Describe(d));
-                return 3;
-            }
-            await DepInstaller.InstallAsync(missing, runner, log, cts.Token, dry);
-            if (!dry)
-            {
-                log.Info("Checking dependencies again:");
-                tc = Toolchain.Detect(log);
-                if (!tc.AllFound)
-                {
-                    log.Error("Still missing: " + string.Join(", ", tc.Dependencies.Where(d => !d.Found).Select(d => d.Name)) +
-                              ". A restart of Windows may be needed after installing Visual Studio.");
-                    return 3;
-                }
-            }
-        }
-
-        var setup = new Setup(dir, iso ?? "", log, runner, tc) { MakeShortcuts = !args.Contains("--no-shortcuts") };
-        setup.Warning += w => log.Info("WARNING: " + w);
-        var pending = setup.Pending();
-        long need = setup.SpaceNeeded(pending), free = FreeSpace(dir);
-        log.Info($"Steps to run: {pending.Count} of {setup.Steps.Count}, about {Util.FormatDuration(setup.Estimate(pending))} " +
-                 $"on a recent PC; needs about {Util.FormatSize(need)}, {Util.FormatSize(free)} free.");
-        foreach (var s in pending) log.Info($"  - {s.Title}");
-        if (dry) return 0;
-        if (free < need)
-        {
-            log.Error($"Not enough free disk space: {Util.FormatSize(need)} needed, {Util.FormatSize(free)} free.");
-            return 4;
-        }
-
-        try
-        {
-            if (args.Contains("--update"))
-            {
-                await setup.UpdateAsync(cts.Token);
-                pending = setup.Pending();
-            }
-            await setup.RunAsync(cts.Token);
-            log.Info($"Done. The game: {setup.ExePath}");
-            return 0;
-        }
-        catch (OperationCanceledException)
-        {
-            runner.KillAll();
-            log.Error("Cancelled. Run the setup again to continue where it stopped.");
-            return 5;
-        }
-        catch (Exception e) when (e is SetupException or IOException or UnauthorizedAccessException or HttpRequestException)
-        {
-            log.Error(e.Message);
-            return 1;
-        }
-    }
-
-    public static long FreeSpace(string dir)
-    {
-        try { return new DriveInfo(Path.GetPathRoot(Path.GetFullPath(dir))!).AvailableFreeSpace; }
-        catch (Exception) { return long.MaxValue; }
-    }
-}
