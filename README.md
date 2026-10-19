@@ -39,6 +39,11 @@ Nothing of the game is downloaded or included. The game files come only
 from your own disc image, and the recompiled code is generated from them on
 your PC.
 
+## Download
+
+**[Blinx2Setup.exe, latest release](https://github.com/bruce-smith/Blinx2-Launcher/releases/latest)**.
+Its SHA-256 is in the release notes.
+
 ## Using it
 
 Double-click `Blinx2Setup.exe`. It needs no .NET installation.
